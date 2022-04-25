@@ -48,7 +48,6 @@ then
     echo "Creating Minikube Cluster"
     minikube start
     helm repo add apache-airflow https://airflow.apache.org
-    helm upgrade --install airflow apache-airflow/airflow -n airflow --create-namespace --debug
 fi
 
 #deploy airflow if not running 
@@ -64,36 +63,73 @@ then
     minikube start
 elif [[ $status == "apiserver: Running" ]]
 then
-    echo "Checking if all pods are running"
-    pods=$(kubectl get pods -n airflow | awk -F " " '{print $3}' | tail -n +2)
-    if [[ $pods == "" ]]
-    then 
-        echo "No pods found."
-        flag=1
+    export status=$(helm history airflow -n airflow --max 1 2>/dev/null | grep -i FAILED)
+
+    if [[ $status ]]
+    then
+        echo "INFO: Previous Release Failed. Uninstalling"
+        helm uninstall airflow -n airflow
+        sleep 10
+    fi
+    helm upgrade --install airflow apache-airflow/airflow -n airflow \
+        --create-namespace \
+        --debug \ 
+        --set executor=LocalExecutor \
+        --set statsd.enabled=false \
+        --set triggerer.enabled=false
+        
+    export status=$(helm history airflow -n airflow --max 1 2>/dev/null | grep -i FAILED)
+    if [[ $status ]]
+    then
+        echo "INFO: Release Failed. Rolling Back"
+        helm rollback airflow -n airflow
     else
-        for pod in $pods
-        do
-            if [[ $pod != "Running"  ]]
+        echo "--------------------------------------------------------"
+        echo "INFO: Checking Components"
+        echo "--------------------------------------------------------"
+        release=$(helm ls -n airflow | grep airflow | awk -F " " '{print $8}')
+        if [[ $release == "deployed" ]]
+        then
+            echo "INFO: Airflow Successfully Deployed."
+            echo "INFO: Checking if all pods are running"
+            pods=$(kubectl get pods -n airflow | awk -F " " '{print $3}' | tail -n +2)
+            if [[ $pods == "" ]]
             then
-                echo "Some pods not running."
+                echo "--------------------------------------------------------"
+                echo "INFO: No pods found."
+                echo "--------------------------------------------------------"
                 flag=1
-                break
+            else
+                for pod in $pods
+                do
+                    if [[ $pod != "Running"  ]]
+                    then
+                        echo "--------------------------------------------------------"
+                        echo "Some pods not running."
+                        echo "--------------------------------------------------------"
+                        flag=1
+                        break
+                    fi
+                done
             fi
-        done
+            if [[ $flag != 1 ]]
+            then
+                echo "--------------------------------------------------------"
+                echo "INFO: To access the UI from the browser at http://localhost:8080"
+                echo "INFO: Run command kubectl port-forward svc/airflow-webserver 8080:8080 -n airflow"
+                echo "--------------------------------------------------------"
+            else
+                echo "Restarting Pods."
+                kubectl delete pods -n airflow --all
+                echo "Waiting for Pods to Restart"
+                kubectl wait --for=jsonpath='{.status.phase}'=Running pod -l component=webserver -n airflow
+            fi
+            helm history airflow -n airflow --max 1
+        else
+            echo "--------------------------------------------------------"
+            echo "INFO: Deployment Failed"
+            echo "--------------------------------------------------------"
+            helm uninstall airflow -n airflow
+        fi
     fi
-    if [[ $flag ]]
-    then 
-        helm upgrade --install airflow apache-airflow/airflow --namespace airflow --create-namespace --debug
-    fi
-fi
-echo "Waiting for Webserver Pod to Spin Up"
-kubectl wait --for=condition=ready pod -l component=webserver -n airflow
-release=$(helm ls -n airflow | grep airflow | awk -F " " '{print $8}')
-if [[ $release == "deployed" ]]
-then
-    echo "All components of Airflow are running."
-    echo "To access the UI from the browser at http://localhost:8080, Run command kubectl port-forward svc/airflow-webserver 8080:8080 -n airflow"
-    echo "To upgrade airflow, run helm upgrade airflow apache-airflow/airflow --namespace airflow -f values.yaml --debug"
-else
-    echo "Airflow Deployment failed."
 fi
